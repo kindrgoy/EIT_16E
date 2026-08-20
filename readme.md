@@ -61,10 +61,10 @@ A fixed-frequency configuration was selected during the initial development stag
 
 The current AD5933 configuration is:
 
-'''cpp
+```cpp
 AD_OUTPUT_RANGE = CTRL_RANGE_200MV;
 AD_PGA_GAIN     = CTRL_PGA_X1;
-'''
+```
 
 The 200 mVpp range and ×1 PGA were selected during hardware characterization to obtain a measurable sensing signal while reducing unnecessary signal amplitude and avoiding excessive amplification in the analog front-end.
 
@@ -84,9 +84,9 @@ Therefore, the lowest excitation level that provides adequate signal quality is 
 
 The INA118 gain is controlled by the external gain resistor `RG`:
 
-'''
+```
 G = 1 + 50 kΩ / RG
-'''
+```
 
 Typical configurations are:
 
@@ -101,10 +101,10 @@ An approximately 5× configuration was tested during development.
 
 For example, with approximately 520 mVpp differential sensing voltage:
 
-'''
+```
 Vout ≈ 520 mVpp × 5
      ≈ 2.6 Vpp
-'''
+```
 
 Clipping was observed because the INA118 was operated from a 3.3 V supply.
 
@@ -120,35 +120,35 @@ The current target is a band-pass response centered around 50 kHz.
 
 ### High-Pass Section
 
-'''
+```
 R = 330 Ω
 C = 10 nF (103)
-'''
+```
 
 Nominal first-order cutoff:
 
-'''
+```
 fc ≈ 48.2 kHz
-'''
+```
 
 The cutoff is calculated using:
 
-'''
+```
 fc = 1 / (2πRC)
-'''
+```
 
 ### Low-Pass Section
 
-'''
+```
 R = 220 Ω
 C = 10 nF (103)
-'''
+```
 
 Nominal first-order cutoff:
 
-'''
+```
 fc ≈ 72.3 kHz
-'''
+```
 
 This places the 50 kHz excitation inside the intended passband.
 
@@ -160,12 +160,12 @@ These values represent nominal first-order RC cutoff frequencies. The actual res
 
 A representative single measurement uses four electrodes:
 
-'''
+```
 HC = 0
 LC = 8
 HP = 1
 LP = 2
-'''
+```
 
 where:
 
@@ -176,17 +176,17 @@ The firmware prevents the sensing electrodes from overlapping the current electr
 
 The raw AD5933 measurement consists of:
 
-'''
+```
 Re
 Im
 Magnitude
-'''
+```
 
 Magnitude is calculated as:
 
-'''
+```
 Magnitude = sqrt(Re² + Im²)
-'''
+```
 
 The current acquisition firmware can average several complex measurements before calculating the reported magnitude.
 
@@ -198,15 +198,15 @@ Repeatability is one of the primary validation steps before calibration and EIT 
 
 The firmware provides:
 
-'''
+```
 rtest HC LC HP LP
-'''
+```
 
 Example:
 
-'''
+```
 rtest 0 8 1 2
-'''
+```
 
 This performs 30 measurements using the specified electrode configuration and prints one magnitude value for each measurement.
 
@@ -229,14 +229,14 @@ Known resistors are used to characterize the complete measurement chain before a
 
 Representative resistor values tested during development include:
 
-'''
+```
 150 Ω
 218 Ω
 327 Ω
 468 Ω
 674 Ω
 1193 Ω
-'''
+```
 
 The objective is to determine:
 
@@ -288,9 +288,7 @@ This led to additional investigation of:
 
 ### INA118 Clipping
 
-A high INA118 gain caused output clipping with the 3.3 V supply.
-
-The gain was therefore reduced for the baseline configuration.
+A high INA118 gain caused output clipping with the 3.3 V supply. The gain was therefore reduced for the baseline configuration.
 ---
 
 ## License
