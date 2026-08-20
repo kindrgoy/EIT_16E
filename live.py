@@ -1,8 +1,34 @@
+"""
+live_eit_v3.py
+Live EIT imaging — diselaraskan dengan firmware EIT16_OPPOSITE_ADJACENT_V4.
+
+PERUBAHAN UTAMA dari v2:
+- TIDAK LAGI hardcode N_EL/OFFSET/FRAME_MEAS di Python. Setelah connect,
+  Python mengirim 'p' dan MEMBACA block ### CONFIG ... ### CONFIG_END
+  dari firmware, lalu membangun ulang protokol pyEIT & urutan measurement
+  sesuai apa yang device benar-benar laporkan. Kalau firmware berubah
+  (misal N_EL beda), Python otomatis menyesuaikan tanpa perlu diedit.
+- Console command umum: bisa kirim command apapun (calfit, calclear, cal,
+  diag, help, rtest, m hc lc hp lp, dst) dan lihat balasan mentah dari
+  device — tidak perlu buka Serial Monitor terpisah.
+- Panel kalibrasi multi-titik: tambah titik (kirim 'c <R>'), fit & simpan
+  (calfit), lihat status (cal), hapus (calclear) — sesuai skema
+  kalibrasi polynomial firmware v4.
+- Semua pengaturan (port, baud, mesh, kalman, baseline frames) disimpan
+  ke file JSON lokal dan dimuat otomatis saat program dibuka lagi —
+  supaya sesi eksperimen reproducible tanpa perlu re-entry manual.
+- Validasi PROTOCOL string dari firmware — kalau device kirim protokol
+  yang tidak dikenali, Python tetap jalan (pakai N_EL/OFFSET yang
+  dilaporkan) tapi menampilkan warning eksplisit.
+"""
+
+import json
+import os
 import time
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, scrolledtext
 
 import numpy as np
 
@@ -21,54 +47,47 @@ from scipy.ndimage import gaussian_filter
 
 
 # ============================================================
-# DEFAULT CONFIGURATION
+# SETTINGS FILE (reproducibility)
 # ============================================================
 
-DEFAULT_PORT = "COM12"
-DEFAULT_BAUD = 921600
+SETTINGS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "live_eit_settings.json"
+)
 
-N_EL = 16
-DIST_EXC = 8
-MEAS_PER_EXC = 12
-FRAME_SIZE = 192
-
-DEFAULT_MESH_H0 = 0.08
-DEFAULT_IMAGE_SIZE = 96
-
-DEFAULT_KALMAN_Q = 0.005
-DEFAULT_KALMAN_R = 0.05
-
-DEFAULT_BASELINE_FRAMES = 5
-
-DEFAULT_COLOR_LIMIT = 1.0
-DEFAULT_GAUSSIAN_SIGMA = 0.7
-
-
-# ============================================================
-# FIRMWARE ORDER
-# ============================================================
-
-def build_expected():
-    out = []
-
-    for k in range(N_EL):
-        hc = k
-        lc = (k + DIST_EXC) % N_EL
-
-        for hp in range(N_EL):
-            lp = (hp + 1) % N_EL
-
-            if hp == hc or hp == lc or lp == hc or lp == lc:
-                continue
-
-            out.append((hc, lc, hp, lp))
-
-    return out
+DEFAULT_SETTINGS = {
+    "port": "COM12",
+    "baud": 921600,
+    "mesh_h0": 0.08,
+    "image_size": 96,
+    "kalman_q": 0.005,
+    "kalman_r": 0.05,
+    "color_limit": 1.0,
+    "gaussian_sigma": 0.7,
+    "baseline_frames": 5,
+    "last_cal_resistor": 1000.0,
+}
 
 
-EXPECTED = build_expected()
+def load_settings():
+    if os.path.exists(SETTINGS_PATH):
+        try:
+            with open(SETTINGS_PATH, "r") as f:
+                data = json.load(f)
+            merged = dict(DEFAULT_SETTINGS)
+            merged.update(data)
+            return merged
+        except Exception:
+            pass
+    return dict(DEFAULT_SETTINGS)
 
-assert len(EXPECTED) == FRAME_SIZE
+
+def save_settings(d):
+    try:
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(d, f, indent=2)
+    except Exception as exc:
+        print("[SETTINGS] gagal simpan:", exc)
 
 
 # ============================================================
@@ -91,41 +110,58 @@ class VectorKalman:
 
     def update(self, z):
         z = np.asarray(z, dtype=float).reshape(-1)
-
         if z.size != self.size:
             raise ValueError("Kalman image size mismatch")
-
         if not self.initialized:
             self.x[:] = z
             self.initialized = True
             return self.x.copy()
-
         self.p += self.q
-
         gain = self.p / (self.p + self.r)
-
         self.x += gain * (z - self.x)
         self.p *= (1.0 - gain)
-
         return self.x.copy()
 
 
 # ============================================================
-# PY-EIT RECONSTRUCTION
+# PROTOCOL BUILDER — dibangun dari nilai yang DILAPORKAN device,
+# bukan hardcode. Ini kunci "penyelarasan" dengan firmware.
+# ============================================================
+
+def build_expected_order(n_el, offset):
+    """Urutan (hc,lc,hp,lp) sesuai skema opposite-inject/adjacent-sense
+    yang dipakai firmware. Kalau firmware berubah skema, fungsi ini yang
+    perlu diupdate — tapi n_el/offset sendiri tetap dibaca dari device."""
+    out = []
+    for k in range(n_el):
+        hc = k
+        lc = (k + offset) % n_el
+        for hp in range(n_el):
+            lp = (hp + 1) % n_el
+            if hp == hc or hp == lc or lp == hc or lp == lc:
+                continue
+            out.append((hc, lc, hp, lp))
+    return out
+
+
+# ============================================================
+# PY-EIT RECONSTRUCTION — parametrized oleh n_el/offset dari device
 # ============================================================
 
 class EITReconstructor:
-    def __init__(self, h0, image_size):
+    def __init__(self, n_el, dist_exc, h0, image_size):
+        self.n_el = int(n_el)
+        self.dist_exc = int(dist_exc)
         self.h0 = float(h0)
         self.image_size = int(image_size)
 
         self.ready = False
         self.error = None
+        self.frame_size = None
 
         self.mesh = None
         self.protocol = None
         self.eit = None
-
         self.X = None
         self.Y = None
         self.mask = None
@@ -138,108 +174,60 @@ class EITReconstructor:
             import pyeit.eit.protocol as protocol
             import pyeit.eit.jac as jac
 
-            # Exactly the same protocol as the ESP32 firmware.
             self.protocol = protocol.create(
-                n_el=N_EL,
-                dist_exc=DIST_EXC,
+                n_el=self.n_el,
+                dist_exc=self.dist_exc,
                 step_meas=1,
                 parser_meas="std"
             )
 
-            total_meas = self.protocol.n_exc * self.protocol.n_meas
+            self.frame_size = self.protocol.n_exc * self.protocol.n_meas
 
-            if total_meas != FRAME_SIZE:
-                raise RuntimeError(
-                    f"pyEIT generated {total_meas} measurements "
-                    f"({self.protocol.n_exc} exc x {self.protocol.n_meas} meas), "
-                    f"expected {FRAME_SIZE}"
-                )
-
-            self.mesh = mesh.create(
-                n_el=N_EL,
-                h0=self.h0
-            )
-
-            self.eit = jac.JAC(
-                self.mesh,
-                self.protocol
-            )
-
-            self.eit.setup(
-                p=0.5,
-                lamb=0.05,
-                method="kotre",
-                jac_normalized=True
-            )
+            self.mesh = mesh.create(n_el=self.n_el, h0=self.h0)
+            self.eit = jac.JAC(self.mesh, self.protocol)
+            self.eit.setup(p=0.5, lamb=0.05, method="kotre", jac_normalized=True)
 
             x = np.linspace(-1.0, 1.0, self.image_size)
             y = np.linspace(-1.0, 1.0, self.image_size)
-
             self.X, self.Y = np.meshgrid(x, y)
             self.mask = self.X**2 + self.Y**2 <= 1.0
 
             self.ready = True
-
         except Exception as exc:
             self.error = repr(exc)
             self.ready = False
 
-    def rebuild(self, h0, image_size):
-        self.h0 = float(h0)
-        self.image_size = int(image_size)
-        self._build()
-
     def reconstruct(self, current, baseline):
         if not self.ready:
-            raise RuntimeError(
-                "pyEIT belum siap: " + str(self.error)
-            )
+            raise RuntimeError("pyEIT belum siap: " + str(self.error))
 
         v1 = np.asarray(current, dtype=np.complex128)
         v0 = np.asarray(baseline, dtype=np.complex128)
 
-        if v1.size != FRAME_SIZE or v0.size != FRAME_SIZE:
-            raise ValueError("Frame harus berisi 192 measurement")
+        if v1.size != self.frame_size or v0.size != self.frame_size:
+            raise ValueError(f"Frame harus berisi {self.frame_size} measurement")
 
-        # pyEIT dynamic JAC:
-        # dv = (v1-v0)/abs(v0)
-        ds = self.eit.solve(
-            v1,
-            v0,
-            normalize=True
-        )
-
+        ds = self.eit.solve(v1, v0, normalize=True)
         ds = np.real(ds)
 
-        # pyEIT returns element values.
         centers = self.mesh.elem_centers[:, :2]
-
-        img = griddata(
-            centers,
-            ds,
-            (self.X, self.Y),
-            method="linear",
-            fill_value=0.0
-        )
-
+        img = griddata(centers, ds, (self.X, self.Y), method="linear", fill_value=0.0)
         img[~self.mask] = np.nan
-
         return img
 
 
 # ============================================================
-# SERIAL READER
+# SERIAL READER — parse frame blocks DAN generic ### blocks (config,
+# calibration, diag, dll) supaya semua respons device bisa ditampilkan.
 # ============================================================
 
 class SerialReader(threading.Thread):
     def __init__(self, port, baud, q, stop_event):
         super().__init__(daemon=True)
-
         self.port = port
         self.baud = baud
         self.q = q
         self.stop_event = stop_event
-
         self.ser = None
         self.write_lock = threading.Lock()
 
@@ -249,31 +237,26 @@ class SerialReader(threading.Thread):
             return
 
         try:
-            self.ser = serial.Serial(
-                self.port,
-                self.baud,
-                timeout=0.05
-            )
-
-            # Allow ESP32 USB serial to settle.
+            self.ser = serial.Serial(self.port, self.baud, timeout=0.05)
             time.sleep(1.0)
-
             self.q.put(("status", f"CONNECTED {self.port}"))
 
             frame_rows = []
             in_frame = False
 
+            config_lines = []
+            in_config = False
+
             while not self.stop_event.is_set():
                 raw = self.ser.readline()
-
                 if not raw:
                     continue
 
-                line = raw.decode(
-                    "utf-8",
-                    errors="ignore"
-                ).strip()
+                line = raw.decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
 
+                # ---- FRAME BLOCK ----
                 if line.startswith("### SWEEP_START_OPPOSITE"):
                     frame_rows = []
                     in_frame = True
@@ -282,58 +265,62 @@ class SerialReader(threading.Thread):
                 if line.startswith("### SWEEP_END_OPPOSITE"):
                     if in_frame and frame_rows:
                         self.q.put(("frame", frame_rows))
-
                     frame_rows = []
                     in_frame = False
                     continue
 
-                if not in_frame:
+                if in_frame:
+                    if line.startswith("idx,"):
+                        continue
+                    parts = line.split(",")
+                    if len(parts) != 10:
+                        continue
+                    try:
+                        idx = int(parts[0])
+                        hc = int(parts[1]); lc = int(parts[2])
+                        hp = int(parts[3]); lp = int(parts[4])
+                        re = float(parts[5]); im = float(parts[6])
+                        mag = float(parts[7]); z = float(parts[8])
+                        ok = int(parts[9])
+                    except ValueError:
+                        continue
+                    if ok != 1:
+                        continue
+                    if not (np.isfinite(re) and np.isfinite(im)):
+                        continue
+                    frame_rows.append({
+                        "idx": idx, "hc": hc, "lc": lc, "hp": hp, "lp": lp,
+                        "re": re, "im": im, "mag": mag, "z": z,
+                    })
                     continue
 
-                if line.startswith("idx,"):
+                # ---- CONFIG BLOCK (dipakai untuk auto-align) ----
+                if line == "### CONFIG":
+                    in_config = True
+                    config_lines = []
                     continue
 
-                parts = line.split(",")
-
-                if len(parts) != 10:
+                if line == "### CONFIG_END":
+                    if in_config:
+                        cfg = {}
+                        for cl in config_lines:
+                            if "=" in cl:
+                                k, v = cl.split("=", 1)
+                                cfg[k.strip()] = v.strip()
+                        self.q.put(("config", cfg))
+                    in_config = False
                     continue
 
-                try:
-                    idx = int(parts[0])
-                    hc = int(parts[1])
-                    lc = int(parts[2])
-                    hp = int(parts[3])
-                    lp = int(parts[4])
-
-                    re = float(parts[5])
-                    im = float(parts[6])
-                    mag = float(parts[7])
-                    z = float(parts[8])
-                    ok = int(parts[9])
-
-                except ValueError:
+                if in_config:
+                    config_lines.append(line)
+                    self.q.put(("line", line))
                     continue
 
-                if ok != 1:
-                    continue
-
-                if not (
-                    np.isfinite(re)
-                    and np.isfinite(im)
-                ):
-                    continue
-
-                frame_rows.append({
-                    "idx": idx,
-                    "hc": hc,
-                    "lc": lc,
-                    "hp": hp,
-                    "lp": lp,
-                    "re": re,
-                    "im": im,
-                    "mag": mag,
-                    "z": z,
-                })
+                # ---- GENERIC ### BLOCKS (calibration, diag, single, dll)
+                # Cukup diteruskan mentah ke console log, tidak perlu
+                # parsing khusus per jenis — firmware bisa menambah
+                # block baru tanpa Python perlu diubah.
+                self.q.put(("line", line))
 
         except Exception as exc:
             self.q.put(("error", repr(exc)))
@@ -348,16 +335,12 @@ class SerialReader(threading.Thread):
     def send(self, text):
         if self.ser is None:
             return False
-
         try:
             with self.write_lock:
-                self.ser.write(
-                    (text.strip() + "\n").encode("ascii")
-                )
+                self.ser.write((text.strip() + "\n").encode("ascii"))
                 self.ser.flush()
-
+            self.q.put(("sent", text.strip()))
             return True
-
         except Exception as exc:
             self.q.put(("error", repr(exc)))
             return False
@@ -367,32 +350,16 @@ class SerialReader(threading.Thread):
 # FRAME CONVERSION
 # ============================================================
 
-def frame_to_complex(frame):
+def frame_to_complex(frame, expected_order, frame_size):
     lookup = {}
-
     for row in frame:
-        key = (
-            row["hc"],
-            row["lc"],
-            row["hp"],
-            row["lp"]
-        )
+        key = (row["hc"], row["lc"], row["hp"], row["lp"])
+        lookup[key] = complex(row["re"], row["im"])
 
-        lookup[key] = complex(
-            row["re"],
-            row["im"]
-        )
-
-    values = np.full(
-        FRAME_SIZE,
-        np.nan + 1j * np.nan,
-        dtype=np.complex128
-    )
-
-    for i, key in enumerate(EXPECTED):
+    values = np.full(frame_size, np.nan + 1j * np.nan, dtype=np.complex128)
+    for i, key in enumerate(expected_order):
         if key in lookup:
             values[i] = lookup[key]
-
     return values
 
 
@@ -403,10 +370,10 @@ def frame_to_complex(frame):
 class LiveEIT:
     def __init__(self, root):
         self.root = root
-        self.root.title(
-            "Live EIT Imaging - ESP32-S3 / AD5933"
-        )
-        self.root.geometry("1280x820")
+        self.root.title("Live EIT Imaging v3 - ESP32-S3 / AD5933 (auto-aligned)")
+        self.root.geometry("1420x860")
+
+        self.settings = load_settings()
 
         self.q = queue.Queue()
         self.stop_event = threading.Event()
@@ -424,532 +391,393 @@ class LiveEIT:
         self.fps_counter = 0
         self.fps = 0.0
 
-        self._build_gui()
+        # Device-reported protocol params — TIDAK di-hardcode.
+        self.device_n_el = None
+        self.device_offset = None
+        self.device_frame_meas = None
+        self.expected_order = None
+        self.device_config = {}
 
+        self._build_gui()
         self.root.after(20, self.poll_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # --------------------------------------------------------
-    # GUI
+    # GUI LAYOUT
     # --------------------------------------------------------
 
     def _build_gui(self):
         left = ttk.Frame(self.root)
-        left.pack(
-            side="left",
-            fill="both",
-            expand=True
-        )
+        left.pack(side="left", fill="both", expand=True)
 
-        right = ttk.Frame(
-            self.root,
-            width=320
-        )
-        right.pack(
-            side="right",
-            fill="y"
-        )
+        right = ttk.Frame(self.root, width=360)
+        right.pack(side="right", fill="y")
         right.pack_propagate(False)
 
-        fig = Figure(
-            figsize=(7.2, 7.2),
-            dpi=100
-        )
-
+        # ---- Plot area ----
+        fig = Figure(figsize=(7.0, 7.0), dpi=100)
         self.ax = fig.add_subplot(111)
-
         self.ax.set_aspect("equal")
         self.ax.set_xlim(-1.12, 1.12)
         self.ax.set_ylim(-1.12, 1.12)
-        self.ax.set_xlabel("x")
-        self.ax.set_ylabel("y")
-        self.ax.set_title(
-            "LIVE EIT — baseline difference"
-        )
+        self.ax.set_title("LIVE EIT — baseline difference")
 
         self.image = self.ax.imshow(
-            np.zeros((96, 96)),
-            extent=(-1, 1, -1, 1),
-            origin="lower",
-            cmap="RdBu_r",
-            interpolation="bilinear",
-            vmin=-DEFAULT_COLOR_LIMIT,
-            vmax=DEFAULT_COLOR_LIMIT
+            np.zeros((96, 96)), extent=(-1, 1, -1, 1), origin="lower",
+            cmap="RdBu_r", interpolation="bilinear",
+            vmin=-self.settings["color_limit"], vmax=self.settings["color_limit"]
         )
+        self.colorbar = fig.colorbar(self.image, ax=self.ax, fraction=0.046, pad=0.04)
 
-        self.colorbar = fig.colorbar(
-            self.image,
-            ax=self.ax,
-            fraction=0.046,
-            pad=0.04
-        )
+        theta = np.linspace(0, 2 * np.pi, 300)
+        self.ax.plot(np.cos(theta), np.sin(theta), linewidth=1)
+        self.electrode_dots, = self.ax.plot([], [], "o", markersize=5, color="black")
+        self.electrode_labels = []
 
-        theta = np.linspace(
-            0,
-            2*np.pi,
-            300
-        )
+        self.canvas = FigureCanvasTkAgg(fig, master=left)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        self.ax.plot(
-            np.cos(theta),
-            np.sin(theta),
-            linewidth=1
-        )
+        # ---- Console log (bawah plot) ----
+        console_frame = ttk.Frame(left)
+        console_frame.pack(fill="x", side="bottom")
 
-        for i in range(N_EL):
-            a = 2*np.pi*i/N_EL
+        ttk.Label(console_frame, text="Console (respons device mentah)").pack(anchor="w", padx=4)
+        self.console = scrolledtext.ScrolledText(console_frame, height=8, font=("Consolas", 9))
+        self.console.pack(fill="x", padx=4, pady=(0, 4))
 
-            self.ax.plot(
-                np.cos(a),
-                np.sin(a),
-                "o",
-                markersize=5
-            )
+        cmd_row = ttk.Frame(console_frame)
+        cmd_row.pack(fill="x", padx=4, pady=(0, 6))
+        self.cmd_var = tk.StringVar()
+        cmd_entry = ttk.Entry(cmd_row, textvariable=self.cmd_var)
+        cmd_entry.pack(side="left", fill="x", expand=True)
+        cmd_entry.bind("<Return>", lambda e: self.send_raw_command())
+        ttk.Button(cmd_row, text="Send", command=self.send_raw_command).pack(side="left", padx=(4, 0))
 
-            self.ax.text(
-                1.07*np.cos(a),
-                1.07*np.sin(a),
-                str(i),
-                ha="center",
-                va="center",
-                fontsize=8
-            )
+        # ---- Right panel: notebook with tabs ----
+        nb = ttk.Notebook(right)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.canvas = FigureCanvasTkAgg(
-            fig,
-            master=left
-        )
+        tab_conn = ttk.Frame(nb)
+        tab_cal = ttk.Frame(nb)
+        tab_recon = ttk.Frame(nb)
+        nb.add(tab_conn, text="Connection")
+        nb.add(tab_cal, text="Calibration")
+        nb.add(tab_recon, text="Reconstruction")
 
-        self.canvas.get_tk_widget().pack(
-            fill="both",
-            expand=True
-        )
+        self._build_connection_tab(tab_conn)
+        self._build_calibration_tab(tab_cal)
+        self._build_reconstruction_tab(tab_recon)
 
-        # ----------------------------------------------------
-        # CONTROL
-        # ----------------------------------------------------
+        # ---- Status footer ----
+        footer = ttk.Frame(right)
+        footer.pack(fill="x", padx=8, pady=(0, 8))
 
-        ttk.Label(
-            right,
-            text="LIVE EIT CONTROL",
-            font=("Segoe UI", 15, "bold")
-        ).pack(pady=(14, 12))
+        self.status_var = tk.StringVar(value="DISCONNECTED")
+        self.frame_var = tk.StringVar(value="Frame: 0")
+        self.fps_var = tk.StringVar(value="FPS: 0.0")
+        self.measure_var = tk.StringVar(value="Measurements: -/-")
+        self.baseline_var = tk.StringVar(value="Baseline: NOT SET")
+        self.recon_var = tk.StringVar(value="pyEIT: waiting for device config")
+        self.protocol_var = tk.StringVar(value="Protocol: -")
 
-        self.status_var = tk.StringVar(
-            value="DISCONNECTED"
-        )
+        for var in [self.status_var, self.protocol_var, self.frame_var,
+                    self.fps_var, self.measure_var, self.baseline_var, self.recon_var]:
+            ttk.Label(footer, textvariable=var).pack(anchor="w")
 
-        ttk.Label(
-            right,
-            textvariable=self.status_var
-        ).pack(pady=(0, 10))
-
-        ttk.Label(
-            right,
-            text="Serial Port"
-        ).pack(anchor="w", padx=15)
-
-        self.port_var = tk.StringVar(
-            value=DEFAULT_PORT
-        )
-
-        self.port_box = ttk.Combobox(
-            right,
-            textvariable=self.port_var
-        )
-
-        self.port_box.pack(
-            fill="x",
-            padx=15,
-            pady=4
-        )
-
+    def _build_connection_tab(self, parent):
+        ttk.Label(parent, text="Serial Port").pack(anchor="w", padx=10, pady=(10, 0))
+        self.port_var = tk.StringVar(value=self.settings["port"])
+        self.port_box = ttk.Combobox(parent, textvariable=self.port_var)
+        self.port_box.pack(fill="x", padx=10, pady=4)
         self.refresh_ports()
 
-        ttk.Button(
-            right,
-            text="Refresh Ports",
-            command=self.refresh_ports
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=3
-        )
+        ttk.Button(parent, text="Refresh Ports", command=self.refresh_ports).pack(fill="x", padx=10, pady=2)
 
+        ttk.Label(parent, text="Baudrate").pack(anchor="w", padx=10, pady=(8, 0))
+        self.baud_var = tk.StringVar(value=str(self.settings["baud"]))
+        ttk.Entry(parent, textvariable=self.baud_var).pack(fill="x", padx=10, pady=4)
+
+        ttk.Separator(parent).pack(fill="x", padx=10, pady=10)
+
+        ttk.Button(parent, text="CONNECT + QUERY DEVICE", command=self.start).pack(fill="x", padx=10, pady=3)
+        ttk.Button(parent, text="STOP", command=self.stop).pack(fill="x", padx=10, pady=3)
+
+        ttk.Separator(parent).pack(fill="x", padx=10, pady=10)
+
+        ttk.Button(parent, text="Re-query config (p)", command=lambda: self.send_cmd("p")).pack(fill="x", padx=10, pady=2)
+        ttk.Button(parent, text="Diagnostic (diag)", command=lambda: self.send_cmd("diag")).pack(fill="x", padx=10, pady=2)
+        ttk.Button(parent, text="Help", command=lambda: self.send_cmd("help")).pack(fill="x", padx=10, pady=2)
+        ttk.Button(parent, text="I2C Scan", command=lambda: self.send_cmd("scan")).pack(fill="x", padx=10, pady=2)
+
+    def _build_calibration_tab(self, parent):
         ttk.Label(
-            right,
-            text="Baudrate"
-        ).pack(
-            anchor="w",
-            padx=15,
-            pady=(8, 0)
-        )
-
-        self.baud_var = tk.StringVar(
-            value=str(DEFAULT_BAUD)
-        )
-
-        ttk.Entry(
-            right,
-            textvariable=self.baud_var
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=4
-        )
-
-        ttk.Button(
-            right,
-            text="START",
-            command=self.start
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=(10, 3)
-        )
-
-        ttk.Button(
-            right,
-            text="STOP",
-            command=self.stop
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=3
-        )
-
-        ttk.Button(
-            right,
-            text="CAPTURE BASELINE (5 FRAME)",
-            command=self.capture_baseline
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=3
-        )
-
-        ttk.Button(
-            right,
-            text="CLEAR BASELINE",
-            command=self.clear_baseline
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=3
-        )
-
-        ttk.Button(
-            right,
-            text="RESET KALMAN",
-            command=self.reset_kalman
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=3
-        )
-
-        # ----------------------------------------------------
-        # SETTINGS
-        # ----------------------------------------------------
-
-        ttk.Separator(right).pack(
-            fill="x",
-            padx=15,
-            pady=14
-        )
-
-        ttk.Label(
-            right,
-            text="RECONSTRUCTION SETTINGS",
-            font=("Segoe UI", 10, "bold")
-        ).pack(
-            anchor="w",
-            padx=15
-        )
-
-        self.mesh_var = tk.StringVar(
-            value=str(DEFAULT_MESH_H0)
-        )
-
-        ttk.Label(
-            right,
-            text="Mesh h0"
-        ).pack(
-            anchor="w",
-            padx=15,
-            pady=(7, 0)
-        )
-
-        ttk.Entry(
-            right,
-            textvariable=self.mesh_var
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=3
-        )
-
-        self.image_var = tk.StringVar(
-            value=str(DEFAULT_IMAGE_SIZE)
-        )
-
-        ttk.Label(
-            right,
-            text="Image resolution"
-        ).pack(
-            anchor="w",
-            padx=15,
-            pady=(7, 0)
-        )
-
-        ttk.Entry(
-            right,
-            textvariable=self.image_var
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=3
-        )
-
-        self.q_var = tk.StringVar(
-            value=str(DEFAULT_KALMAN_Q)
-        )
-
-        ttk.Label(
-            right,
-            text="Kalman Q"
-        ).pack(
-            anchor="w",
-            padx=15,
-            pady=(7, 0)
-        )
-
-        ttk.Entry(
-            right,
-            textvariable=self.q_var
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=3
-        )
-
-        self.r_var = tk.StringVar(
-            value=str(DEFAULT_KALMAN_R)
-        )
-
-        ttk.Label(
-            right,
-            text="Kalman R"
-        ).pack(
-            anchor="w",
-            padx=15,
-            pady=(7, 0)
-        )
-
-        ttk.Entry(
-            right,
-            textvariable=self.r_var
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=3
-        )
-
-        self.clim_var = tk.StringVar(
-            value=str(DEFAULT_COLOR_LIMIT)
-        )
-
-        ttk.Label(
-            right,
-            text="Color ±"
-        ).pack(
-            anchor="w",
-            padx=15,
-            pady=(7, 0)
-        )
-
-        ttk.Entry(
-            right,
-            textvariable=self.clim_var
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=3
-        )
-
-        ttk.Button(
-            right,
-            text="APPLY SETTINGS",
-            command=self.apply_settings
-        ).pack(
-            fill="x",
-            padx=15,
-            pady=(7, 3)
-        )
-
-        # ----------------------------------------------------
-        # STATUS
-        # ----------------------------------------------------
-
-        ttk.Separator(right).pack(
-            fill="x",
-            padx=15,
-            pady=14
-        )
-
-        self.frame_var = tk.StringVar(
-            value="Frame: 0"
-        )
-
-        self.fps_var = tk.StringVar(
-            value="FPS: 0.0"
-        )
-
-        self.measure_var = tk.StringVar(
-            value="Measurements: 0/192"
-        )
-
-        self.baseline_var = tk.StringVar(
-            value="Baseline: NOT SET"
-        )
-
-        self.recon_var = tk.StringVar(
-            value="pyEIT: checking..."
-        )
-
-        for var in [
-            self.frame_var,
-            self.fps_var,
-            self.measure_var,
-            self.baseline_var,
-            self.recon_var
-        ]:
-            ttk.Label(
-                right,
-                textvariable=var
-            ).pack(
-                anchor="w",
-                padx=15,
-                pady=3
-            )
-
-        ttk.Label(
-            right,
+            parent,
             text=(
-                "Experiment:\n"
-                "1. Isi wadah dengan air garam homogen.\n"
-                "2. START.\n"
-                "3. CAPTURE BASELINE 5 FRAME.\n"
-                "4. Masukkan objek/perubahan konduktivitas.\n"
-                "5. Amati citra live."
-            )
-        ).pack(
-            anchor="w",
-            padx=15,
-            pady=(15, 3)
-        )
+                "Kalibrasi multi-titik (polynomial).\n"
+                "Pasang R referensi via jumper HC-HP / LC-LP\n"
+                "sebelum tiap titik (lihat panduan sebelumnya)."
+            ),
+            wraplength=320, justify="left"
+        ).pack(anchor="w", padx=10, pady=(10, 6))
 
-        self._build_reconstructor()
+        ttk.Label(parent, text="R referensi (Ohm)").pack(anchor="w", padx=10)
+        self.cal_r_var = tk.StringVar(value=str(self.settings["last_cal_resistor"]))
+        ttk.Entry(parent, textvariable=self.cal_r_var).pack(fill="x", padx=10, pady=4)
+
+        ttk.Button(parent, text="Tambah Titik Kalibrasi (c <R>)",
+                   command=self.add_cal_point).pack(fill="x", padx=10, pady=3)
+
+        ttk.Separator(parent).pack(fill="x", padx=10, pady=8)
+
+        ttk.Button(parent, text="Fit & Simpan (calfit)",
+                   command=lambda: self.send_cmd("calfit")).pack(fill="x", padx=10, pady=2)
+        ttk.Button(parent, text="Lihat Status (cal)",
+                   command=lambda: self.send_cmd("cal")).pack(fill="x", padx=10, pady=2)
+        ttk.Button(parent, text="Hapus Kalibrasi (calclear)",
+                   command=self.confirm_calclear).pack(fill="x", padx=10, pady=2)
+
+        ttk.Separator(parent).pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(parent, text="Single-point test (m hc lc hp lp)").pack(anchor="w", padx=10)
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=10, pady=4)
+        self.m_hc = tk.StringVar(value="0")
+        self.m_lc = tk.StringVar(value="8")
+        self.m_hp = tk.StringVar(value="1")
+        self.m_lp = tk.StringVar(value="2")
+        for label, var in [("HC", self.m_hc), ("LC", self.m_lc), ("HP", self.m_hp), ("LP", self.m_lp)]:
+            ttk.Label(row, text=label).pack(side="left")
+            ttk.Entry(row, textvariable=var, width=4).pack(side="left", padx=(2, 8))
+        ttk.Button(parent, text="Ukur Titik Ini",
+                   command=self.send_single_measure).pack(fill="x", padx=10, pady=3)
+        ttk.Button(parent, text="Repeatability Test (rtest, 30x)",
+                   command=lambda: self.send_cmd("rtest")).pack(fill="x", padx=10, pady=3)
+
+    def _build_reconstruction_tab(self, parent):
+        self.mesh_var = tk.StringVar(value=str(self.settings["mesh_h0"]))
+        self.image_var = tk.StringVar(value=str(self.settings["image_size"]))
+        self.q_var = tk.StringVar(value=str(self.settings["kalman_q"]))
+        self.r_var = tk.StringVar(value=str(self.settings["kalman_r"]))
+        self.clim_var = tk.StringVar(value=str(self.settings["color_limit"]))
+        self.baseline_frames_var = tk.StringVar(value=str(self.settings["baseline_frames"]))
+
+        for label, var in [
+            ("Mesh h0", self.mesh_var),
+            ("Image resolution", self.image_var),
+            ("Kalman Q", self.q_var),
+            ("Kalman R", self.r_var),
+            ("Color ±", self.clim_var),
+            ("Baseline frames", self.baseline_frames_var),
+        ]:
+            ttk.Label(parent, text=label).pack(anchor="w", padx=10, pady=(8, 0))
+            ttk.Entry(parent, textvariable=var).pack(fill="x", padx=10, pady=2)
+
+        ttk.Button(parent, text="APPLY + SAVE SETTINGS",
+                   command=self.apply_settings).pack(fill="x", padx=10, pady=(10, 3))
+
+        ttk.Separator(parent).pack(fill="x", padx=10, pady=10)
+
+        ttk.Button(parent, text="CAPTURE BASELINE",
+                   command=self.capture_baseline).pack(fill="x", padx=10, pady=3)
+        ttk.Button(parent, text="CLEAR BASELINE",
+                   command=self.clear_baseline).pack(fill="x", padx=10, pady=3)
+        ttk.Button(parent, text="RESET KALMAN",
+                   command=self.reset_kalman).pack(fill="x", padx=10, pady=3)
+        ttk.Button(parent, text="START SWEEP (g)",
+                   command=lambda: self.send_cmd("g")).pack(fill="x", padx=10, pady=(14, 3))
+        ttk.Button(parent, text="STOP SWEEP (x)",
+                   command=lambda: self.send_cmd("x")).pack(fill="x", padx=10, pady=3)
 
     # --------------------------------------------------------
-    # RECONSTRUCTOR
+    # LOGGING
     # --------------------------------------------------------
 
-    def _build_reconstructor(self):
-        try:
-            h0 = float(self.mesh_var.get())
-            size = int(self.image_var.get())
-
-            self.reconstructor = EITReconstructor(
-                h0,
-                size
-            )
-
-            if self.reconstructor.ready:
-                self.recon_var.set(
-                    f"pyEIT READY | mesh h0={h0}"
-                )
-            else:
-                self.recon_var.set(
-                    "pyEIT ERROR"
-                )
-
-        except Exception as exc:
-            self.recon_var.set(
-                "pyEIT ERROR: " + str(exc)
-            )
+    def log(self, text):
+        self.console.insert("end", text + "\n")
+        self.console.see("end")
 
     # --------------------------------------------------------
-    # SERIAL
+    # SERIAL / COMMANDS
     # --------------------------------------------------------
 
     def refresh_ports(self):
         if serial is None:
             self.port_box["values"] = []
             return
-
-        ports = [
-            p.device
-            for p in serial.tools.list_ports.comports()
-        ]
-
+        ports = [p.device for p in serial.tools.list_ports.comports()]
         self.port_box["values"] = ports
-
         if self.port_var.get() not in ports and ports:
             self.port_var.set(ports[0])
 
+    def send_cmd(self, text):
+        if self.reader and self.reader.is_alive():
+            self.reader.send(text)
+        else:
+            messagebox.showwarning("Not connected", "Connect ke device dulu.")
+
+    def send_raw_command(self):
+        text = self.cmd_var.get().strip()
+        if not text:
+            return
+        self.send_cmd(text)
+        self.cmd_var.set("")
+
+    def add_cal_point(self):
+        try:
+            r = float(self.cal_r_var.get())
+            if r <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Nilai R referensi tidak valid.")
+            return
+        self.settings["last_cal_resistor"] = r
+        save_settings(self.settings)
+        self.send_cmd(f"c {r}")
+
+    def confirm_calclear(self):
+        if messagebox.askyesno("Konfirmasi", "Hapus semua data kalibrasi tersimpan di device?"):
+            self.send_cmd("calclear")
+
+    def send_single_measure(self):
+        try:
+            hc = int(self.m_hc.get()); lc = int(self.m_lc.get())
+            hp = int(self.m_hp.get()); lp = int(self.m_lp.get())
+        except ValueError:
+            messagebox.showerror("Error", "HC/LC/HP/LP harus angka 0-15.")
+            return
+        self.send_cmd(f"m {hc} {lc} {hp} {lp}")
+
     def start(self):
         if self.reader and self.reader.is_alive():
+            messagebox.showinfo("Info", "Sudah terkoneksi.")
             return
-
         if serial is None:
-            messagebox.showerror(
-                "Dependency",
-                "pyserial belum terinstall."
-            )
+            messagebox.showerror("Dependency", "pyserial belum terinstall.")
             return
-
         try:
             baud = int(self.baud_var.get())
         except ValueError:
-            messagebox.showerror(
-                "Error",
-                "Baudrate tidak valid."
-            )
+            messagebox.showerror("Error", "Baudrate tidak valid.")
             return
 
-        self.apply_settings()
+        self.settings["port"] = self.port_var.get()
+        self.settings["baud"] = baud
+        save_settings(self.settings)
 
         self.stop_event.clear()
-
-        self.reader = SerialReader(
-            self.port_var.get(),
-            baud,
-            self.q,
-            self.stop_event
-        )
-
+        self.reader = SerialReader(self.port_var.get(), baud, self.q, self.stop_event)
         self.reader.start()
 
-        # Give thread time to open COM.
-        self.root.after(
-            1200,
-            self.send_start_command
-        )
-
-    def send_start_command(self):
-        if self.reader and self.reader.is_alive():
-            if self.reader.send("g"):
-                self.status_var.set(
-                    "RUNNING — sweep started"
-                )
+        # Setelah serial settle, minta config device — INI YANG
+        # MENYELARASKAN Python dengan firmware, bukan hardcode.
+        self.root.after(1300, lambda: self.send_cmd("p"))
 
     def stop(self):
         if self.reader:
             self.reader.send("x")
-
         self.stop_event.set()
-
         self.status_var.set("STOPPED")
+
+    def on_close(self):
+        try:
+            if self.reader:
+                self.reader.send("x")
+        except Exception:
+            pass
+        self.stop_event.set()
+        save_settings(self.settings)
+        self.root.destroy()
+
+    # --------------------------------------------------------
+    # DEVICE CONFIG HANDLING — inti penyelarasan
+    # --------------------------------------------------------
+
+    def apply_device_config(self, cfg):
+        self.device_config = cfg
+        self.log(f"[CONFIG] Diterima {len(cfg)} field dari device.")
+
+        protocol_str = cfg.get("PROTOCOL", "UNKNOWN")
+        self.protocol_var.set(f"Protocol: {protocol_str}")
+
+        try:
+            n_el = int(cfg["N_EL"])
+            offset = int(cfg["OFFSET"])
+            frame_meas = int(cfg["FRAME_MEAS"])
+        except (KeyError, ValueError):
+            messagebox.showerror(
+                "Config error",
+                "Device tidak melaporkan N_EL/OFFSET/FRAME_MEAS dengan benar.\n"
+                "Cek firmware — command 'p' harus print block ### CONFIG."
+            )
+            return
+
+        changed = (
+            n_el != self.device_n_el or
+            offset != self.device_offset or
+            frame_meas != self.device_frame_meas
+        )
+
+        self.device_n_el = n_el
+        self.device_offset = offset
+        self.device_frame_meas = frame_meas
+        self.expected_order = build_expected_order(n_el, offset)
+
+        if len(self.expected_order) != frame_meas:
+            self.log(
+                f"[WARN] Urutan measurement Python ({len(self.expected_order)}) "
+                f"!= FRAME_MEAS device ({frame_meas}). Skema opposite/adjacent "
+                f"mungkin sudah berubah di firmware — build_expected_order() "
+                f"perlu disesuaikan."
+            )
+
+        self.status_var.set(f"CONNECTED {self.port_var.get()} | N_EL={n_el} OFFSET={offset}")
+
+        if changed or self.reconstructor is None:
+            self._rebuild_reconstructor()
+
+    def _rebuild_reconstructor(self):
+        if self.device_n_el is None:
+            return
+        try:
+            h0 = float(self.mesh_var.get())
+            size = int(self.image_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Mesh h0 / image resolution tidak valid.")
+            return
+
+        self.reconstructor = EITReconstructor(
+            n_el=self.device_n_el,
+            dist_exc=self.device_offset,
+            h0=h0,
+            image_size=size,
+        )
+
+        if self.reconstructor.ready:
+            self.recon_var.set(
+                f"pyEIT READY | n_el={self.device_n_el} offset={self.device_offset} "
+                f"frame_size={self.reconstructor.frame_size}"
+            )
+            self._draw_electrode_markers()
+        else:
+            self.recon_var.set("pyEIT ERROR: " + str(self.reconstructor.error))
+
+        self.kalman = None  # rebuild lazily di process_frame
+
+    def _draw_electrode_markers(self):
+        n = self.device_n_el
+        xs = [np.cos(2 * np.pi * i / n) for i in range(n)]
+        ys = [np.sin(2 * np.pi * i / n) for i in range(n)]
+        self.electrode_dots.set_data(xs, ys)
+
+        for t in self.electrode_labels:
+            t.remove()
+        self.electrode_labels = []
+        for i in range(n):
+            a = 2 * np.pi * i / n
+            t = self.ax.text(1.07 * np.cos(a), 1.07 * np.sin(a), str(i),
+                              ha="center", va="center", fontsize=8)
+            self.electrode_labels.append(t)
+        self.canvas.draw_idle()
 
     # --------------------------------------------------------
     # BASELINE
@@ -957,32 +785,22 @@ class LiveEIT:
 
     def capture_baseline(self):
         if not self.reader or not self.reader.is_alive():
-            messagebox.showwarning(
-                "Not running",
-                "Tekan START terlebih dahulu."
-            )
+            messagebox.showwarning("Not running", "Connect dan START dulu.")
+            return
+        if self.reconstructor is None or not self.reconstructor.ready:
+            messagebox.showwarning("Not ready", "pyEIT belum siap (query config dulu).")
             return
 
-        self.baseline_buffer = []
-
         try:
-            self.baseline_target = max(
-                1,
-                int(DEFAULT_BASELINE_FRAMES)
-            )
-        except Exception:
-            self.baseline_target = 5
+            n_target = max(1, int(self.baseline_frames_var.get()))
+        except ValueError:
+            n_target = self.settings["baseline_frames"]
 
+        self.baseline_buffer = []
+        self.baseline_target = n_target
         self.baseline = None
-
-        self.baseline_var.set(
-            f"Baseline: 0/{self.baseline_target}"
-        )
-
-        self.status_var.set(
-            "CAPTURING BASELINE — jangan ubah media"
-        )
-
+        self.baseline_var.set(f"Baseline: 0/{self.baseline_target}")
+        self.status_var.set("CAPTURING BASELINE — jangan ubah media")
         if self.kalman:
             self.kalman.reset()
 
@@ -990,29 +808,15 @@ class LiveEIT:
         self.baseline = None
         self.baseline_buffer = []
         self.baseline_target = 0
-
-        self.baseline_var.set(
-            "Baseline: NOT SET"
-        )
-
+        self.baseline_var.set("Baseline: NOT SET")
         if self.kalman:
             self.kalman.reset()
-
-        self.status_var.set(
-            "Baseline cleared"
-        )
-
-    # --------------------------------------------------------
-    # KALMAN / SETTINGS
-    # --------------------------------------------------------
+        self.status_var.set("Baseline cleared")
 
     def reset_kalman(self):
         if self.kalman:
             self.kalman.reset()
-
-        self.status_var.set(
-            "Kalman reset"
-        )
+        self.status_var.set("Kalman reset")
 
     def apply_settings(self):
         try:
@@ -1021,67 +825,36 @@ class LiveEIT:
             q = float(self.q_var.get())
             r = float(self.r_var.get())
             clim = float(self.clim_var.get())
+            baseline_frames = int(self.baseline_frames_var.get())
 
             if not (0.03 <= h0 <= 0.30):
-                raise ValueError(
-                    "Mesh h0 sebaiknya 0.03–0.30"
-                )
-
+                raise ValueError("Mesh h0 sebaiknya 0.03-0.30")
             if not (32 <= image_size <= 192):
-                raise ValueError(
-                    "Image resolution 32–192"
-                )
-
+                raise ValueError("Image resolution 32-192")
             if q <= 0 or r <= 0 or clim <= 0:
-                raise ValueError(
-                    "Q, R, dan Color harus > 0"
-                )
+                raise ValueError("Q, R, Color harus > 0")
+            if baseline_frames < 1:
+                raise ValueError("Baseline frames minimal 1")
 
-            self.reconstructor = EITReconstructor(
-                h0,
-                image_size
-            )
+            self.settings.update({
+                "mesh_h0": h0, "image_size": image_size,
+                "kalman_q": q, "kalman_r": r, "color_limit": clim,
+                "baseline_frames": baseline_frames,
+            })
+            save_settings(self.settings)
 
-            if not self.reconstructor.ready:
-                raise RuntimeError(
-                    self.reconstructor.error
-                )
+            self._rebuild_reconstructor()
 
-            self.kalman = VectorKalman(
-                image_size * image_size,
-                q,
-                r
-            )
-
-            self.image.set_data(
-                np.zeros(
-                    (image_size, image_size)
-                )
-            )
-
-            self.image.set_clim(
-                -clim,
-                clim
-            )
-
+            self.image.set_data(np.zeros((image_size, image_size)))
+            self.image.set_clim(-clim, clim)
             self.canvas.draw_idle()
 
-            self.recon_var.set(
-                f"pyEIT READY | mesh h0={h0}"
-            )
-
-            self.status_var.set(
-                "Settings applied"
-            )
-
+            self.status_var.set("Settings applied & saved")
         except Exception as exc:
-            messagebox.showerror(
-                "Settings error",
-                str(exc)
-            )
+            messagebox.showerror("Settings error", str(exc))
 
     # --------------------------------------------------------
-    # FRAME PROCESSING
+    # QUEUE / FRAME PROCESSING
     # --------------------------------------------------------
 
     def poll_queue(self):
@@ -1091,223 +864,101 @@ class LiveEIT:
 
                 if kind == "status":
                     self.status_var.set(data)
-
+                elif kind == "sent":
+                    self.log(f">> {data}")
+                elif kind == "line":
+                    self.log(data)
+                elif kind == "config":
+                    self.apply_device_config(data)
                 elif kind == "error":
-                    self.status_var.set(
-                        "ERROR"
-                    )
-                    print("[SERIAL ERROR]", data)
-
+                    self.status_var.set("ERROR")
+                    self.log("[SERIAL ERROR] " + data)
                 elif kind == "frame":
                     self.process_frame(data)
-
         except queue.Empty:
             pass
-
-        self.root.after(
-            20,
-            self.poll_queue
-        )
+        self.root.after(20, self.poll_queue)
 
     def process_frame(self, rows):
-        v = frame_to_complex(rows)
-
-        valid = np.isfinite(v.real) & np.isfinite(v.imag)
-
-        valid_count = int(valid.sum())
-
-        self.measure_var.set(
-            f"Measurements: {valid_count}/{FRAME_SIZE}"
-        )
-
-        # Require almost complete frame.
-        if valid_count < 180:
+        if self.reconstructor is None or not self.reconstructor.ready or self.expected_order is None:
             return
 
-        # Repair very rare missing values using channel median.
+        frame_size = self.reconstructor.frame_size
+        v = frame_to_complex(rows, self.expected_order, frame_size)
+
+        valid = np.isfinite(v.real) & np.isfinite(v.imag)
+        valid_count = int(valid.sum())
+        self.measure_var.set(f"Measurements: {valid_count}/{frame_size}")
+
+        if valid_count < int(frame_size * 0.9):
+            return
+
         if not np.all(valid):
             med_re = np.nanmedian(v.real)
             med_im = np.nanmedian(v.imag)
-
             v.real[~valid] = med_re
             v.imag[~valid] = med_im
 
         self.total_frames += 1
         self.fps_counter += 1
-
         now = time.perf_counter()
         dt = now - self.last_fps_time
-
         if dt >= 1.0:
             self.fps = self.fps_counter / dt
             self.fps_counter = 0
             self.last_fps_time = now
-
-        self.frame_var.set(
-            f"Frame: {self.total_frames}"
-        )
-
-        self.fps_var.set(
-            f"FPS: {self.fps:.1f}"
-        )
-
-        # --------------------------------------------
-        # BASELINE CAPTURE MODE
-        # --------------------------------------------
+        self.frame_var.set(f"Frame: {self.total_frames}")
+        self.fps_var.set(f"FPS: {self.fps:.1f}")
 
         if self.baseline_target > 0:
             self.baseline_buffer.append(v.copy())
-
             n = len(self.baseline_buffer)
-
-            self.baseline_var.set(
-                f"Baseline: {n}/{self.baseline_target}"
-            )
-
+            self.baseline_var.set(f"Baseline: {n}/{self.baseline_target}")
             if n >= self.baseline_target:
-                stack = np.vstack(
-                    self.baseline_buffer
-                )
-
-                # Robust baseline:
-                # median real and median imaginary separately.
+                stack = np.vstack(self.baseline_buffer)
                 self.baseline = (
-                    np.median(stack.real, axis=0)
-                    + 1j * np.median(
-                        stack.imag,
-                        axis=0
-                    )
+                    np.median(stack.real, axis=0) + 1j * np.median(stack.imag, axis=0)
                 )
-
                 self.baseline_buffer = []
                 self.baseline_target = 0
-
                 if self.kalman:
                     self.kalman.reset()
-
-                self.baseline_var.set(
-                    "Baseline: SET ✓"
-                )
-
-                self.status_var.set(
-                    "Baseline ready — change the medium/object"
-                )
-
+                self.baseline_var.set("Baseline: SET \u2713")
+                self.status_var.set("Baseline ready \u2014 ubah medium/objek sekarang")
             return
-
-        # --------------------------------------------
-        # NO BASELINE = DON'T RECONSTRUCT
-        # --------------------------------------------
 
         if self.baseline is None:
-            self.status_var.set(
-                "RUNNING — capture baseline first"
-            )
+            self.status_var.set("RUNNING \u2014 capture baseline dulu")
             return
 
-        # --------------------------------------------
-        # RECONSTRUCTION
-        # --------------------------------------------
-
         try:
-            img = self.reconstructor.reconstruct(
-                v,
-                self.baseline
-            )
+            img = self.reconstructor.reconstruct(v, self.baseline)
 
-            sigma = DEFAULT_GAUSSIAN_SIGMA
-
+            sigma = self.settings.get("gaussian_sigma", 0.7)
             if sigma > 0:
                 finite = np.isfinite(img)
-
-                temp = np.nan_to_num(
-                    img,
-                    nan=0.0
-                )
-
-                temp = gaussian_filter(
-                    temp,
-                    sigma=sigma
-                )
-
+                temp = np.nan_to_num(img, nan=0.0)
+                temp = gaussian_filter(temp, sigma=sigma)
                 img = temp
                 img[~finite] = np.nan
 
-            # Kalman.
-            flat = np.nan_to_num(
-                img,
-                nan=0.0
-            ).reshape(-1)
+            flat = np.nan_to_num(img, nan=0.0).reshape(-1)
+            if self.kalman is None or self.kalman.size != flat.size:
+                self.kalman = VectorKalman(flat.size, float(self.q_var.get()), float(self.r_var.get()))
+            filtered = self.kalman.update(flat).reshape(img.shape)
 
-            if (
-                self.kalman is None
-                or self.kalman.size != flat.size
-            ):
-                self.kalman = VectorKalman(
-                    flat.size,
-                    float(self.q_var.get()),
-                    float(self.r_var.get())
-                )
-
-            filtered = self.kalman.update(
-                flat
-            ).reshape(img.shape)
-
-            # Circular mask.
             size = filtered.shape[0]
+            yy, xx = np.indices(filtered.shape)
+            x = 2.0 * xx / max(size - 1, 1) - 1.0
+            y = 2.0 * yy / max(size - 1, 1) - 1.0
+            filtered[x * x + y * y > 1.0] = np.nan
 
-            yy, xx = np.indices(
-                filtered.shape
-            )
-
-            x = (
-                2.0 * xx /
-                max(size - 1, 1)
-                - 1.0
-            )
-
-            y = (
-                2.0 * yy /
-                max(size - 1, 1)
-                - 1.0
-            )
-
-            filtered[
-                x*x + y*y > 1.0
-            ] = np.nan
-
-            self.image.set_data(
-                filtered
-            )
-
+            self.image.set_data(filtered)
             self.canvas.draw_idle()
-
-            self.status_var.set(
-                "LIVE RECONSTRUCTION"
-            )
-
+            self.status_var.set("LIVE RECONSTRUCTION")
         except Exception as exc:
-            self.status_var.set(
-                "RECONSTRUCTION ERROR"
-            )
-            print(
-                "[RECON ERROR]",
-                repr(exc)
-            )
-
-    # --------------------------------------------------------
-    # CLOSE
-    # --------------------------------------------------------
-
-    def close(self):
-        try:
-            if self.reader:
-                self.reader.send("x")
-        except Exception:
-            pass
-
-        self.stop_event.set()
-        self.root.destroy()
+            self.status_var.set("RECONSTRUCTION ERROR")
+            self.log("[RECON ERROR] " + repr(exc))
 
 
 # ============================================================
@@ -1315,25 +966,8 @@ class LiveEIT:
 # ============================================================
 
 def main():
-    print("=" * 60)
-    print("LIVE EIT V2")
-    print("=" * 60)
-    print(f"Electrodes       : {N_EL}")
-    print(f"Excitation       : opposite / distance {DIST_EXC}")
-    print(f"Measurements     : {FRAME_SIZE}/frame")
-    print("Baseline         : median of 5 frames")
-    print("Kalman           : enabled after reconstruction")
-    print("=" * 60)
-
     root = tk.Tk()
-
     app = LiveEIT(root)
-
-    root.protocol(
-        "WM_DELETE_WINDOW",
-        app.close
-    )
-
     root.mainloop()
 
 

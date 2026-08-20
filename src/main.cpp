@@ -1195,7 +1195,7 @@ void print_config()
 {
   Serial.println("### CONFIG");
 
-  Serial.println("PROTOCOL=EIT16_OPPOSITE_ADJACENT_V4");
+  Serial.println("PROTOCOL=EIT16_OPPOSITE");
   Serial.printf("N_EL=%d\n", N_EL);
   Serial.printf("OFFSET=%d\n", OFFSET);
   Serial.printf("MEAS_PER_EXC=%d\n", MEAS_PER_EXC);

@@ -1,0 +1,14 @@
+{
+  "port": "COM12",
+  "baud": 921600,
+  "mesh_h0": 0.06,
+  "image_size": 96,
+  "kalman_q": 0.001,
+  "kalman_r": 0.01,
+  "color_limit": 0.5,
+  "gaussian_sigma": 0.7,
+  "baseline_frames": 5,
+  "last_cal_resistor": 1000.0,
+  "jac_p": 0.5,
+  "jac_lamb": 0.25
+}
