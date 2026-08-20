@@ -1,27 +1,3 @@
-"""
-live_eit_v3.py
-Live EIT imaging — diselaraskan dengan firmware EIT16_OPPOSITE_ADJACENT_V4.
-
-PERUBAHAN UTAMA dari v2:
-- TIDAK LAGI hardcode N_EL/OFFSET/FRAME_MEAS di Python. Setelah connect,
-  Python mengirim 'p' dan MEMBACA block ### CONFIG ... ### CONFIG_END
-  dari firmware, lalu membangun ulang protokol pyEIT & urutan measurement
-  sesuai apa yang device benar-benar laporkan. Kalau firmware berubah
-  (misal N_EL beda), Python otomatis menyesuaikan tanpa perlu diedit.
-- Console command umum: bisa kirim command apapun (calfit, calclear, cal,
-  diag, help, rtest, m hc lc hp lp, dst) dan lihat balasan mentah dari
-  device — tidak perlu buka Serial Monitor terpisah.
-- Panel kalibrasi multi-titik: tambah titik (kirim 'c <R>'), fit & simpan
-  (calfit), lihat status (cal), hapus (calclear) — sesuai skema
-  kalibrasi polynomial firmware v4.
-- Semua pengaturan (port, baud, mesh, kalman, baseline frames) disimpan
-  ke file JSON lokal dan dimuat otomatis saat program dibuka lagi —
-  supaya sesi eksperimen reproducible tanpa perlu re-entry manual.
-- Validasi PROTOCOL string dari firmware — kalau device kirim protokol
-  yang tidak dikenali, Python tetap jalan (pakai N_EL/OFFSET yang
-  dilaporkan) tapi menampilkan warning eksplisit.
-"""
-
 import json
 import os
 import time
